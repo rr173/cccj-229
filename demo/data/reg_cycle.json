@@ -1,0 +1,26 @@
+{
+  "registry_id": "reg-cycle",
+  "reports": [
+    {
+      "report_id": "rpt_cycle",
+      "name": "Cyclic Metrics Report",
+      "query": {
+        "select": [
+          {"metric": "metric_a", "version": "v1", "alias": "a"},
+          {"metric": "metric_b", "version": "v1", "alias": "b"}
+        ],
+        "group_by": ["date"],
+        "where": null
+      }
+    }
+  ],
+  "consumers": [
+    {
+      "consumer_id": "cycle_team",
+      "report_id": "rpt_cycle",
+      "allowed_changes": ["DEPENDENCY_CHANGED", "AGG_CHANGED", "FIELD_REMOVED"],
+      "migration_window": {"start": "2026-02-01", "end": "2026-03-01"},
+      "target_versions": {"metric_a": "v2", "metric_b": "v2"}
+    }
+  ]
+}

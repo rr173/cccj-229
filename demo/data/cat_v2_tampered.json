@@ -1,0 +1,91 @@
+{
+  "catalog_id": "cat-v2",
+  "dimensions": [
+    {"name": "date", "field": "orders.date"},
+    {"name": "region", "field": "orders.region"},
+    {"name": "channel", "field": "orders.channel"}
+  ],
+  "fields": [
+    {"name": "orders.amount", "table": "orders", "type": "number"},
+    {"name": "orders.cost", "table": "orders", "type": "number"},
+    {"name": "orders.status", "table": "orders", "type": "string"},
+    {"name": "orders.region", "table": "orders", "type": "string"},
+    {"name": "orders.channel", "table": "orders", "type": "string"},
+    {"name": "orders.date", "table": "orders", "type": "date"}
+  ],
+  "metrics": [
+    {
+      "name": "revenue",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date", "region"],
+      "filter": {"op": "cmp", "cmp": "=",
+                 "left": {"op": "field", "name": "orders.status"},
+                 "right": {"op": "lit", "value": "completed"}},
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.amount"}}
+    },
+    {
+      "name": "revenue",
+      "version": "v2",
+      "effective_from": "2026-02-01",
+      "grain": ["date", "region"],
+      "filter": {"op": "in",
+                 "left": {"op": "field", "name": "orders.status"},
+                 "values": ["completed", "pending", "refunded"]},
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.amount"}},
+      "description": "TAMPERED: pending orders silently added to the filter"
+    },
+    {
+      "name": "revenue",
+      "version": "v3",
+      "effective_from": "2026-02-01",
+      "grain": ["date", "region", "channel"],
+      "filter": {"op": "cmp", "cmp": "=",
+                 "left": {"op": "field", "name": "orders.status"},
+                 "right": {"op": "lit", "value": "completed"}},
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.amount"}}
+    },
+    {
+      "name": "net_revenue",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date", "region"],
+      "filter": null,
+      "agg": {"op": "sub", "args": [
+        {"op": "metric", "name": "revenue", "version": "v1"},
+        {"op": "sum", "arg": {"op": "field", "name": "orders.cost"}}
+      ]}
+    },
+    {
+      "name": "net_revenue",
+      "version": "v2",
+      "effective_from": "2026-02-01",
+      "grain": ["date", "region"],
+      "filter": null,
+      "agg": {"op": "sub", "args": [
+        {"op": "metric", "name": "revenue", "version": "v2"},
+        {"op": "sum", "arg": {"op": "field", "name": "orders.cost"}}
+      ]}
+    },
+    {
+      "name": "daily_revenue",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date", "region"],
+      "filter": {"op": "cmp", "cmp": "=",
+                 "left": {"op": "field", "name": "orders.status"},
+                 "right": {"op": "lit", "value": "completed"}},
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.amount"}}
+    },
+    {
+      "name": "daily_revenue",
+      "version": "v2",
+      "effective_from": "2026-02-01",
+      "grain": ["region"],
+      "filter": {"op": "cmp", "cmp": "=",
+                 "left": {"op": "field", "name": "orders.status"},
+                 "right": {"op": "lit", "value": "completed"}},
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.amount"}}
+    }
+  ]
+}

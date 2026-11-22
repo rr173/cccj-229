@@ -1,0 +1,52 @@
+{
+  "catalog_id": "cat-cycle",
+  "dimensions": [
+    {"name": "date", "field": "orders.date"}
+  ],
+  "fields": [
+    {"name": "orders.amount", "table": "orders", "type": "number"},
+    {"name": "orders.date", "table": "orders", "type": "date"}
+  ],
+  "metrics": [
+    {
+      "name": "metric_a",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date"],
+      "filter": null,
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.amount"}}
+    },
+    {
+      "name": "metric_b",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date"],
+      "filter": null,
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.amount"}}
+    },
+    {
+      "name": "metric_a",
+      "version": "v2",
+      "effective_from": "2026-02-01",
+      "grain": ["date"],
+      "filter": null,
+      "agg": {"op": "add", "args": [
+        {"op": "metric", "name": "metric_b", "version": "v2"},
+        {"op": "lit", "value": 1}
+      ]},
+      "description": "depends on metric_b@v2"
+    },
+    {
+      "name": "metric_b",
+      "version": "v2",
+      "effective_from": "2026-02-01",
+      "grain": ["date"],
+      "filter": null,
+      "agg": {"op": "add", "args": [
+        {"op": "metric", "name": "metric_a", "version": "v2"},
+        {"op": "lit", "value": 1}
+      ]},
+      "description": "depends on metric_a@v2 -> dependency cycle"
+    }
+  ]
+}

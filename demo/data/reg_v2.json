@@ -1,0 +1,100 @@
+{
+  "registry_id": "reg-v2",
+  "reports": [
+    {
+      "report_id": "rpt_regional",
+      "name": "Regional Revenue Report",
+      "query": {
+        "select": [
+          {"metric": "revenue", "version": "v1", "alias": "rev"},
+          {"metric": "net_revenue", "version": "v1", "alias": "net"}
+        ],
+        "group_by": ["region"],
+        "where": {"op": "in",
+                  "left": {"op": "field", "name": "orders.region"},
+                  "values": ["US", "CA"]}
+      }
+    },
+    {
+      "report_id": "rpt_daily",
+      "name": "Daily Operations Report",
+      "query": {
+        "select": [
+          {"metric": "daily_revenue", "version": "v1", "alias": "daily_rev"}
+        ],
+        "group_by": ["date", "region"],
+        "where": null
+      }
+    },
+    {
+      "report_id": "rpt_exec",
+      "name": "Executive Summary",
+      "query": {
+        "select": [
+          {"metric": "revenue", "version": "v1", "alias": "rev"}
+        ],
+        "group_by": ["region"],
+        "where": null
+      }
+    },
+    {
+      "report_id": "rpt_channel",
+      "name": "Channel Breakdown",
+      "query": {
+        "select": [
+          {"metric": "revenue", "version": "v1", "alias": "rev"}
+        ],
+        "group_by": ["region"],
+        "where": null
+      }
+    },
+    {
+      "report_id": "rpt_growth",
+      "name": "Growth Comparison (fixed: single version)",
+      "query": {
+        "select": [
+          {"metric": "revenue", "version": "v1", "alias": "rev"}
+        ],
+        "group_by": ["region"],
+        "where": null
+      }
+    }
+  ],
+  "consumers": [
+    {
+      "consumer_id": "fin_ops",
+      "report_id": "rpt_regional",
+      "allowed_changes": ["FILTER_CHANGED", "DEPENDENCY_CHANGED"],
+      "migration_window": {"start": "2026-02-01", "end": "2026-03-01"},
+      "target_versions": {"revenue": "v2", "net_revenue": "v2"}
+    },
+    {
+      "consumer_id": "ops_analytics",
+      "report_id": "rpt_daily",
+      "allowed_changes": ["GRAIN_CHANGED"],
+      "migration_window": {"start": "2026-02-01", "end": "2026-03-01"},
+      "target_versions": {"daily_revenue": "v2"}
+    },
+    {
+      "consumer_id": "exec_team",
+      "report_id": "rpt_exec",
+      "allowed_changes": ["FILTER_CHANGED"],
+      "migration_window": {"start": "2026-02-01", "end": "2026-03-01"},
+      "target_versions": {"revenue": "v2"}
+    },
+    {
+      "consumer_id": "bi_team",
+      "report_id": "rpt_channel",
+      "allowed_changes": ["DIMENSION_ADDED"],
+      "migration_window": {"start": "2026-02-01", "end": "2026-03-01"},
+      "target_versions": {"revenue": "v3"}
+    },
+    {
+      "consumer_id": "growth",
+      "report_id": "rpt_growth",
+      "allowed_changes": ["FILTER_CHANGED"],
+      "migration_window": {"start": "2026-02-01", "end": "2026-03-01"},
+      "target_versions": {"revenue": "v2"}
+    }
+  ]
+}

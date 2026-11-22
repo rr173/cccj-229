@@ -1,0 +1,25 @@
+{
+  "registry_id": "reg-v3",
+  "reports": [
+    {
+      "report_id": "rpt_regional",
+      "name": "Regional Revenue Report (post-migration state)",
+      "query": {
+        "select": [
+          {"metric": "net_revenue", "version": "v2", "alias": "net"}
+        ],
+        "group_by": ["region"],
+        "where": null
+      }
+    }
+  ],
+  "consumers": [
+    {
+      "consumer_id": "fin_ops",
+      "report_id": "rpt_regional",
+      "allowed_changes": ["FIELD_REMOVED"],
+      "migration_window": {"start": "2026-04-01", "end": "2026-05-01"},
+      "target_versions": {"net_revenue": "v3"}
+    }
+  ]
+}

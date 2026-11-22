@@ -1,0 +1,42 @@
+{
+  "catalog_id": "cat-broken",
+  "dimensions": [
+    {"name": "date", "field": "orders.date"}
+  ],
+  "fields": [
+    {"name": "orders.amount", "table": "orders", "type": "number"},
+    {"name": "orders.date", "table": "orders", "type": "date"}
+  ],
+  "metrics": [
+    {
+      "name": "ghost_field_metric",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date"],
+      "filter": null,
+      "agg": {"op": "sum", "arg": {"op": "field", "name": "orders.ghost"}},
+      "description": "references a field that does not exist in the lineage"
+    },
+    {
+      "name": "ghost_dep_metric",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date"],
+      "filter": null,
+      "agg": {"op": "add", "args": [
+        {"op": "metric", "name": "revenue", "version": "v9"},
+        {"op": "lit", "value": 1}
+      ]},
+      "description": "references a metric version that does not exist"
+    },
+    {
+      "name": "illegal_op_metric",
+      "version": "v1",
+      "effective_from": "2026-01-01",
+      "grain": ["date"],
+      "filter": null,
+      "agg": {"op": "drop_table", "args": [{"op": "lit", "value": 1}]},
+      "description": "uses an operator outside the restricted AST"
+    }
+  ]
+}
