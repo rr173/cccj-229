@@ -23,7 +23,9 @@ crashed) batch the database still shows exactly the previous batch's results.
 Refresh is incremental: corrected rows are looked up by id, only the groups
 those rows directly touch are recomputed, and changes propagate to upstream
 groups through a reverse reference index (``slice_refs``).  Neither all facts
-nor all groups are ever scanned.
+nor all groups are ever scanned.  The same transaction also maintains
+``slice_fact_groups``, the prepared index behind ``slice-impact`` withdrawal
+audits (which committed fact belongs to which closure group).
 
 Semantics (whole version-reference closure of the root):
   * every metric applies its own row filter and grain to the corrected,
@@ -452,6 +454,10 @@ def init_slice(db, slice_name, catalog_id, seq, root_name, root_version):
     if store.get_slice(db, slice_name) is not None:
         raise SliceError([f"slice '{slice_name}' already exists"])
     store.create_slice(db, slice_name, catalog_id, seq, root_name, root_version)
+    # an empty fact set has a complete (empty) withdrawal index by definition
+    db.execute("INSERT OR REPLACE INTO slice_impact_prep VALUES (?,?,0)",
+               (slice_name, store._now()))
+    db.commit()
     return closure
 
 
@@ -618,6 +624,32 @@ def apply_batch(db, slice_name, corrections, on_commit=None):
                    (slice_name, m.key, gk))
         changed.add((m.key, gk))        # group disappeared
 
+    def reindex_facts(rows):
+        """Keep the prepared withdrawal model in step with this batch.
+
+        For every corrected fact (old and new state) the ``slice_fact_groups``
+        rows recording which closure group it belongs to are rewritten inside
+        the same transaction as the facts themselves, so a failed batch can
+        never leave a half-updated impact index behind.
+        """
+        ids = [fid for fid, _row in rows]
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        db.execute(
+            "DELETE FROM slice_fact_groups WHERE slice_name = ? AND"
+            f" fact_id IN ({marks})", [slice_name, *ids])
+        fresh = []
+        for fid, row in rows:
+            if row is None:
+                continue
+            for m in metrics.values():
+                if eval_filter(m.filter, row):
+                    fresh.append((slice_name, fid, m.key, astx.canon(
+                        [row[f] for f in m.grain_fields])))
+        db.executemany(
+            "INSERT INTO slice_fact_groups VALUES (?,?,?,?)", fresh)
+
     def compute_value(m, gk, klist):
         leaf_vals = {}
         for lid, (kind, _field) in m.leaves.items():
@@ -698,6 +730,11 @@ def apply_batch(db, slice_name, corrections, on_commit=None):
                             json.dumps(new, ensure_ascii=False)))
         db.execute("UPDATE slices SET facts_count = facts_count + ?"
                    " WHERE slice_name=?", (delta_facts, slice_name))
+
+        # ---- phase 1b: keep the withdrawal-impact reverse index current -----
+        # Only the final state of each corrected fact matters: a delete leaves
+        # nothing behind, a put records exactly the group it now belongs to.
+        reindex_facts([(c["id"], c["row"]) for c in corrections])
 
         # ---- phase 2: recompute touched groups, propagate upstream ---------
         heap = []
@@ -811,3 +848,332 @@ def read_slice(db, slice_name):
             "grain": list(root.grain),
             "facts": meta["facts_count"],
             "groups": groups}
+
+
+# ------------------------------------------------- withdrawal-impact audits
+#
+# "What if this one order had never been booked?"  A withdrawal audit answers
+# that from committed state only: no fact is deleted, no refresh is executed
+# and rolled back, and the slice's materialized groups, mirror history and
+# version are untouched.  Each candidate is withdrawn on its own from the same
+# committed baseline — candidates never accumulate.
+#
+# Every fact can occupy one group per closure metric (e.g. its fine-grained
+# group and the coarse group that group projects to, possibly on several
+# expression paths).  Withdrawing it removes it from *all* of those positions
+# at once, and the resulting world is judged once as a single candidate.  Two
+# orders that share a count_distinct value keep that value alive, because only
+# facts that are actually absent are subtracted.
+#
+# Preparation: ``slice_fact_groups`` records, for every committed fact and
+# every closure metric whose filter it passes, the single group it belongs to.
+# It is built once by ``prepare_impact`` (which may scan facts) and then kept
+# current by every refresh for exactly the corrected rows, inside the refresh
+# transaction, so a rejected batch leaves the previous index intact.
+#
+# A query loads only the target group and the groups reachable from it along
+# reference projection, the facts behind those groups and their materialized
+# leaves; it never scans all facts or all root groups, and it never walks a
+# group's member list once per candidate.
+
+IMPACT_ABSENT = "absent"
+
+
+def _fact_sort_key(fid):
+    """Order fact ids by their JSON type and value (strings before integers)."""
+    return (0, fid) if isinstance(fid, str) else (1, fid)
+
+
+def prepare_impact(db, slice_name):
+    """One-time preparation of the withdrawal-impact index from committed facts.
+
+    Idempotent.  A slice created by ``slice-init`` already starts prepared
+    (empty fact set); this is only needed for a slice whose index is missing.
+    """
+    meta = store.get_slice(db, slice_name)
+    if meta is None:
+        raise SliceError([f"slice '{slice_name}' not found"])
+    cat = store.get_catalog(db, meta["catalog_id"], meta["catalog_seq"])
+    closure = compile_closure(cat["content"], meta["root_name"],
+                              meta["root_version"])
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM slice_fact_groups WHERE slice_name = ?",
+                   (slice_name,))
+        n = 0
+        for r in db.execute(
+                "SELECT fact_id, row_json FROM slice_facts WHERE slice_name=?"
+                " ORDER BY fact_id", (slice_name,)):
+            row = json.loads(r["row_json"])
+            for m in closure.metrics.values():
+                if eval_filter(m.filter, row):
+                    db.execute(
+                        "INSERT INTO slice_fact_groups VALUES (?,?,?,?)",
+                        (slice_name, r["fact_id"], m.key, astx.canon(
+                            [row[f] for f in m.grain_fields])))
+            n += 1
+        db.execute("INSERT OR REPLACE INTO slice_impact_prep VALUES (?,?,?)",
+                   (slice_name, store._now(), n))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"slice": slice_name, "facts": n,
+            "entries": db.execute(
+                "SELECT COUNT(*) AS n FROM slice_fact_groups WHERE slice_name=?",
+                (slice_name,)).fetchone()["n"]}
+
+
+def _impact_key(closure, key):
+    """Validate a complete root group key and return (gk, keydict)."""
+    root = closure.metrics[closure.root_key]
+    if isinstance(key, str):
+        try:
+            key = json.loads(key)
+        except json.JSONDecodeError as exc:
+            raise SliceError([f"root key is not valid JSON: {exc}"])
+    if isinstance(key, dict):
+        if set(key) != set(root.grain):
+            raise SliceError([f"root key must give exactly the root grain "
+                              f"{root.grain}, got {sorted(key)}"])
+        keydict = {d: key[d] for d in root.grain}
+    elif isinstance(key, list):
+        if len(key) != len(root.grain):
+            raise SliceError([f"root key array must have {len(root.grain)} "
+                              f"value(s), one per root grain dimension "
+                              f"{root.grain}"])
+        keydict = dict(zip(root.grain, key))
+    else:
+        raise SliceError(["root key must be a JSON object or array"])
+    for dim, val in keydict.items():
+        if not (isinstance(val, str) and val != ""):
+            raise SliceError([f"root key dimension '{dim}' must be a "
+                              f"non-empty string, got {val!r}"])
+    return astx.canon([keydict[d] for d in root.grain]), keydict
+
+
+class _ImpactModel:
+    """Committed material for the target group's reference cone plus a
+    one-time membership listing (no per-candidate member traversal)."""
+
+    def __init__(self, db, slice_name, closure, keydict):
+        self.db = db
+        self.slice_name = slice_name
+        self.closure = closure
+        self.metrics = closure.metrics
+        # Every closure grain is a subset of the root grain, so the single
+        # group each metric can contribute to the target is fixed by the
+        # reference projection of the root key.
+        self.keys = {}       # metric -> (gkey, [values])
+        for mkey, m in self.metrics.items():
+            try:
+                vals = [keydict[d] for d in m.grain]
+            except KeyError:            # unreachable after closure validation
+                raise SliceError([f"metric '{mkey}' references a dimension "
+                                  f"outside the root grain"])
+            self.keys[mkey] = (astx.canon(vals), vals)
+        self.groups = {}
+        self.members = {}
+        self.sums = {}
+        self.cds = {}
+        self.deps = {}       # group -> [dependency groups]
+        self.parents = {mkey: [] for mkey in self.metrics}
+        for mkey, m in self.metrics.items():
+            for dep in m.refs:
+                self.parents[dep].append(mkey)
+        self._load()
+
+    def _load(self):
+        for mkey in self.metrics:
+            gk, vals = self.keys[mkey]
+            ck = (mkey, gk)
+            r = self.db.execute(
+                "SELECT row_count, value FROM slice_groups WHERE slice_name=?"
+                " AND metric=? AND gkey=?",
+                (self.slice_name, mkey, gk)).fetchone()
+            if r is None:
+                self.groups[ck] = None
+                self.members[ck] = {}
+                self.sums[ck] = {}
+                self.cds[ck] = {}
+            else:
+                self.groups[ck] = (r["row_count"],
+                                   None if r["value"] is None
+                                   else int(r["value"]))
+                self.members[ck] = {
+                    f["fact_id"]: None for f in self.db.execute(
+                        "SELECT fact_id FROM slice_fact_groups WHERE"
+                        " slice_name=? AND metric=? AND gkey=?",
+                        (self.slice_name, mkey, gk))}
+                self.sums[ck] = {
+                    s["leaf"]: int(s["total"]) for s in self.db.execute(
+                        "SELECT leaf, total FROM slice_sums WHERE slice_name=?"
+                        " AND metric=? AND gkey=?",
+                        (self.slice_name, mkey, gk))}
+                cds = {}
+                for c in self.db.execute(
+                        "SELECT leaf, val, cnt FROM slice_cds WHERE"
+                        " slice_name=? AND metric=? AND gkey=?",
+                        (self.slice_name, mkey, gk)):
+                    cds.setdefault(c["leaf"], {})[c["val"]] = c["cnt"]
+                self.cds[ck] = cds
+            m = self.metrics[mkey]
+            self.deps[ck] = []
+            for dep, idx in m.proj.items():
+                dvals = [vals[i] for i in idx]
+                self.deps[ck].append((dep, astx.canon(dvals)))
+        # membership listed once: every candidate's positions are then a dict
+        # lookup, never a per-candidate walk over the groups' member lists
+        self.positions = {}
+        for ck, mem in self.members.items():
+            for fid in mem:
+                self.positions.setdefault(fid, []).append(ck)
+        # fetch each participating fact's row exactly once
+        ids = sorted({fid for mem in self.members.values() for fid in mem},
+                     key=_fact_sort_key)
+        self.rows = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            for r in self.db.execute(
+                    "SELECT fact_id, row_json FROM slice_facts WHERE"
+                    f" slice_name=? AND fact_id IN ({marks})",
+                    [self.slice_name, *chunk]):
+                self.rows[r["fact_id"]] = json.loads(r["row_json"])
+
+    def candidates(self):
+        out = set()
+        for mem in self.members.values():
+            out.update(mem)
+        return out
+
+    def positions_of(self, fact_id):
+        return self.positions.get(fact_id, [])
+
+    def affected(self, hit):
+        """Groups whose value can move: the hit groups and every ancestor up
+        to the target root group (the target is the last cone entry)."""
+        root_ck = (self.closure.root_key,
+                   self.keys[self.closure.root_key][0])
+        seen = set(hit)
+        frontier = list(hit)
+        while frontier:
+            ck = frontier.pop()
+            for parent in self.parents[ck[0]]:
+                pck = (parent, self.keys[parent][0])
+                if pck not in seen:
+                    seen.add(pck)
+                    frontier.append(pck)
+        if root_ck not in seen:
+            return []
+        return sorted(seen, key=lambda ck: self.metrics[ck[0]].rank)
+
+    def evaluate(self, fact_id):
+        """Target value after withdrawing only ``fact_id`` (ABSENT = gone)."""
+        hit = self.positions_of(fact_id)
+        if not hit:
+            return self.groups[(self.closure.root_key,
+                                self.keys[self.closure.root_key][0])][1]
+        order = self.affected(hit)
+        root_ck = (self.closure.root_key, self.keys[self.closure.root_key][0])
+        if root_ck not in order:            # defensive; hit always reaches root
+            return self.groups[root_ck][1]
+        hitset = set(hit)
+        values = {}
+        row = self.rows.get(fact_id)
+        for ck in order:
+            state = self.groups[ck]
+            if state is None:
+                values[ck] = IMPACT_ABSENT
+                continue
+            row_count, _committed = state
+            in_group = ck in hitset
+            if in_group and row_count - 1 <= 0:
+                values[ck] = IMPACT_ABSENT
+                continue
+            m = self.metrics[ck[0]]
+            leaf_vals = {}
+            for lid, (kind, field) in m.leaves.items():
+                if kind == "sum":
+                    total = self.sums[ck].get(lid, 0)
+                    if in_group:
+                        total -= row[field]
+                    leaf_vals[lid] = total
+                else:
+                    counts = dict(self.cds[ck].get(lid, {}))
+                    if in_group:
+                        v = row[field]
+                        left = counts.get(v, 0) - 1
+                        if left <= 0:
+                            counts.pop(v, None)
+                        else:
+                            counts[v] = left
+                    leaf_vals[lid] = len(counts)
+            ref_vals = {}
+            for dep, dgk in self.deps[ck]:
+                dck = (dep, dgk)
+                if dck in values:
+                    dv = values[dck]
+                else:
+                    dstate = self.groups.get(dck)
+                    dv = None if dstate is None else dstate[1]
+                ref_vals[dep] = None if dv is IMPACT_ABSENT else dv
+            values[ck] = eval_expr(m.expr, leaf_vals, ref_vals)
+        return values[root_ck]
+
+
+def query_withdrawal_impact(db, slice_name, key):
+    """Withdrawal impact of single facts on one root group of a slice.
+
+    ``key`` is a complete root group key: an object covering exactly the root
+    grain, or a JSON array in grain order (``{}`` / ``[]`` for an empty grain).
+    Returns the group's current value plus every fact whose *single* removal
+    changes the group's existence or value, with its original id and the
+    post-withdrawal state.  A non-existent root group is an explicit error,
+    never an empty-looking success.
+    """
+    meta = store.get_slice(db, slice_name)
+    if meta is None:
+        raise SliceError([f"slice '{slice_name}' not found"])
+    cat = store.get_catalog(db, meta["catalog_id"], meta["catalog_seq"])
+    closure = compile_closure(cat["content"], meta["root_name"],
+                              meta["root_version"])
+    root = closure.metrics[closure.root_key]
+    if db.execute("SELECT 1 FROM slice_impact_prep WHERE slice_name = ?",
+                  (slice_name,)).fetchone() is None:
+        raise SliceError([f"slice '{slice_name}' has no prepared withdrawal "
+                          f"index; run `slice-impact-prepare` once for this "
+                          f"slice"])
+
+    gk, keydict = _impact_key(closure, key)
+    current = db.execute(
+        "SELECT value FROM slice_groups WHERE slice_name=? AND metric=? AND"
+        " gkey=?", (slice_name, closure.root_key, gk)).fetchone()
+    if current is None:
+        shown = json.dumps(keydict, ensure_ascii=False, sort_keys=True)
+        raise SliceError([f"root group {shown} does not exist in slice "
+                          f"'{slice_name}' (root {closure.root_key})"])
+    cur_value = None if current["value"] is None else int(current["value"])
+
+    model = _ImpactModel(db, slice_name, closure, keydict)
+    changes = []
+    for fid in sorted(model.candidates(), key=_fact_sort_key):
+        after = model.evaluate(fid)
+        if after is IMPACT_ABSENT:
+            changes.append({"id": json.loads(fid), "state": "group_removed"})
+        elif after is None:
+            if cur_value is None:
+                continue                     # still present, still null
+            changes.append({"id": json.loads(fid), "state": "null",
+                            "value": None})
+        elif cur_value is not None and after == cur_value:
+            continue                         # exact value did not move
+        else:
+            changes.append({"id": json.loads(fid), "state": "value",
+                            "value": after})
+    return {"slice": slice_name,
+            "root": closure.root_key,
+            "grain": list(root.grain),
+            "key": {d: keydict[d] for d in root.grain},
+            "current": cur_value,
+            "changes": changes}

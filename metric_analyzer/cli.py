@@ -14,6 +14,8 @@ Interfaces:
   slice-init        create a named offline slice (pinned catalog import + root)
   slice-refresh     apply a JSONL fact-correction batch to a slice (incremental)
   slice-read        read the root metric's groups of a slice (JSON)
+  slice-impact-prepare  build a slice's withdrawal-impact index once
+  slice-impact      single-fact withdrawal impact on one root group (JSON)
   slices            list stored slices
   mirror-enable     enable versioned mirror delivery for an existing slice (v0)
   mirror-export     stream a full / delta integrity-checked mirror JSONL file
@@ -407,6 +409,26 @@ def cmd_slice_read(args):
     _emit(result, True)
 
 
+def cmd_slice_impact_prepare(args):
+    db = store.connect(args.db)
+    try:
+        info = slices.prepare_impact(db, args.slice)
+    except slices.SliceError as exc:
+        _fail(exc.errors[0], EXIT_INVALID)
+    print(f"slice '{args.slice}': withdrawal-impact index prepared "
+          f"({info['facts']} fact(s), {info['entries']} group position(s))")
+    print("  later refreshes keep it current for exactly the corrected rows")
+
+
+def cmd_slice_impact(args):
+    db = store.connect(args.db)
+    try:
+        result = slices.query_withdrawal_impact(db, args.slice, args.key)
+    except slices.SliceError as exc:
+        _fail(exc.errors[0], EXIT_INVALID)
+    _emit(result, True)
+
+
 def cmd_slices(args):
     db = store.connect(args.db)
     for row in store.list_slices(db):
@@ -575,6 +597,21 @@ def main(argv=None):
                        help="read the root metric's groups of a slice (JSON)")
     p.add_argument("--slice", required=True)
     p.set_defaults(fn=cmd_slice_read)
+
+    p = sub.add_parser("slice-impact-prepare",
+                       help="build the single-fact withdrawal-impact index for "
+                            "a slice once (refreshes then maintain it)")
+    p.add_argument("--slice", required=True)
+    p.set_defaults(fn=cmd_slice_impact_prepare)
+
+    p = sub.add_parser("slice-impact",
+                       help="which single facts would change one root group if "
+                            "withdrawn, and how (JSON)")
+    p.add_argument("--slice", required=True)
+    p.add_argument("--key", required=True,
+                   help="complete root group key as a JSON object, or a JSON "
+                        "array in grain order; '{}' for an empty grain")
+    p.set_defaults(fn=cmd_slice_impact)
 
     p = sub.add_parser("slices", help="list stored slices")
     p.set_defaults(fn=cmd_slices)

@@ -93,6 +93,28 @@ CREATE TABLE IF NOT EXISTS slice_refs (   -- reverse index: who references a dep
   parent_gkey   TEXT NOT NULL,
   PRIMARY KEY (slice_name, dep_metric, dep_gkey, parent_metric, parent_gkey)
 );
+-- Prepared reverse index for withdrawal-impact audits: for every committed
+-- fact and every metric in the slice closure whose filter it passes, the one
+-- group it belongs to.  Built once by `slice-impact-prepare` (which may scan
+-- facts) and then maintained incrementally by every refresh inside the same
+-- transaction as the facts and materialized values.
+CREATE TABLE IF NOT EXISTS slice_fact_groups (
+  slice_name TEXT NOT NULL,
+  fact_id    TEXT NOT NULL,              -- canonical JSON of the correction id
+  metric     TEXT NOT NULL,
+  gkey       TEXT NOT NULL,              -- canonical JSON array in metric grain order
+  PRIMARY KEY (slice_name, fact_id, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_slice_fact_groups_group
+  ON slice_fact_groups (slice_name, metric, gkey, fact_id);
+-- Marks a slice whose withdrawal-impact model has been fully prepared.  A
+-- refresh before this marker exists keeps the index current for corrected
+-- rows; `slice-impact-prepare` rebuilds the whole index and sets the marker.
+CREATE TABLE IF NOT EXISTS slice_impact_prep (
+  slice_name  TEXT PRIMARY KEY,
+  prepared_at TEXT NOT NULL,
+  facts       INTEGER NOT NULL
+);
 -- ---- slice mirror delivery (see mirror.py) -------------------------------
 -- Persistent delivery identity + committed version of one enabled slice.
 -- source_id is generated once at enable time and never changes: reopening

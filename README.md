@@ -18,7 +18,8 @@ metric_analyzer/          产品代码
   core.py                 语义 diff、影响分析、阻断规则、拓扑排序、计划应用（纯函数）
   loader.py               目录/注册表导入校验（引用必须可解析）
   store.py                SQLite：目录/注册表版本历史、计划、切片存储、镜像版本台账
-  slices.py               离线指标切片：闭包编译、JSONL 更正解析、增量刷新、读取
+  slices.py               离线指标切片：闭包编译、JSONL 更正解析、增量刷新、读取、
+                          单笔撤回影响查询
   mirror.py               切片镜像交付：源端启用/流式全量与补发、接收端校验/原子入库/查询
   cli.py                  全部对外接口
 reference/
@@ -31,6 +32,7 @@ demo/
 tests/
   test_slice.py           切片刷新链路测试（独立整算基准逐批核对）
   test_mirror.py          镜像交付测试（版本、补发净差、完整性、来源链、快照并发）
+  test_slice_impact.py    单笔撤回影响测试（完整清单对独立整算预言机核对）
 ```
 
 ## 数据模型
@@ -98,6 +100,9 @@ slice-init    --slice S --catalog cat-v1 --seq 1 --metric revenue@v1
                                          # 首次刷新：创建命名切片（钉住目录导入 + 根指标）
 slice-refresh --slice S --file corr.jsonl  # 应用一批事实更正（增量）
 slice-read    --slice S                    # 读取根指标分组结果（JSON）
+slice-impact-prepare --slice S             # 一次性准备单笔撤回影响索引
+slice-impact  --slice S --key '{"day":"2026-10-01","region":"east"}'
+                                         # 单笔撤回影响：当前值 + 会改变它的订单（JSON）
 slices                                   # 切片列表
 mirror-enable  --slice S                  # 现有切片启用镜像交付，落第 0 版
 mirror-export  --slice S --out f.jsonl [--from N]  # 全量或 N→当前版补发
@@ -205,6 +210,57 @@ v1→v2 移除 date）、仅增加可选维度（`revenue` v1→v3 增加 channe
 - **原子**：事实与物化值同事务提交；一批失败（或进程中断）后重新打开
   数据库，只能看到上一批完整结果，刷新可继续。
 
+### 单笔撤回影响查询（审计）
+
+审计问的是“如果某一笔订单其实不该入账，单独撤掉它会怎样”。`slice-impact`
+只读已提交状态：不删事实、不执行刷新再回滚，也不改变切片、刷新版本或镜像
+历史。
+
+```bash
+# 新建切片（slice-init）时已准备好空索引，无需额外操作；
+# 仅当切片缺少准备标记时才需要一次性准备：
+python3 -m metric_analyzer.cli --db app.db slice-impact-prepare --slice month-end
+
+python3 -m metric_analyzer.cli --db app.db slice-impact --slice month-end \
+  --key '{"day": "2026-10-01", "region": "east"}'
+# 也可用 grain 顺序的数组：--key '["2026-10-01", "east"]'
+# 空粒度根的键为 {}；--key 必填且必须给出完整根分组键
+```
+
+输出（JSON）：
+
+```json
+{
+  "slice": "month-end", "root": "net_daily@v1", "grain": ["day", "region"],
+  "key": {"day": "2026-10-01", "region": "east"}, "current": -200,
+  "changes": [
+    {"id": "o-1", "state": "group_removed"},
+    {"id": "o-2", "state": "null", "value": null},
+    {"id": "o-3", "state": "value", "value": 0}
+  ]
+}
+```
+
+- `current` 是该组当前物化值（整数或 `null`）。
+- 每笔 `changes[]` 都是**只撤这一笔**、回到同一份已提交事实的独立结果，
+  彼此不累积；`state`：`group_removed`（组消失）、`null`（组仍在、值变
+  `null`）、`value`（组仍在、精确整数，含 `0`）。只列出状态或值确实变化
+  的订单，每个 ID 至多一条，ID 保留原 JSON 类型（字符串或整数）。
+- 指定的根组不存在时命令失败（退出码 1，明确报告查无此组），不返回看似
+  成功的空清单。
+- 撤回按本切片已绑定的定义计算：过滤、维度投影、依赖与当前刷新规则一致。
+  一笔事实可能同时属于目标组和它引用的粗/细组，甚至出现在两条计算路径上；
+  查询一次性从所有这些位置移除它，再判断总体结果（相抵而值不变则不出现在
+  清单里）。共享同一去重值的另一笔订单仍保留该值。不在目标组、但通过粗
+  粒度依赖影响该格子的订单也会被列出。
+
+**准备与开销**：`slice_fact_groups` 记录每条已提交事实在每个闭包指标下所属
+的唯一分组；`slice-init` 以空集建立，之后每次 `slice-refresh` 在自己的事务
+内只重写本批更正行对应的条目，失败批次不会留下半新半旧的关系，也无需每批
+重建全部准备数据。单次查询只访问目标组、沿引用到达的实际分组、参与这些
+分组的事实与物化叶子（以及一次性的组成员清单），不扫全部事实或全部根组，
+也不对每个候选重新遍历分组。刷新本身仍只处理更正波及的范围。
+
 ### 测试
 
 ```bash
@@ -216,6 +272,14 @@ python3 -m unittest
 过滤进出；删掉同一客户的部分订单再删其最后一条订单（去重计数）；依赖组
 消失时仍存在的父组 vs 根组消失 vs 结果为零；含坏行批次回滚后继续刷新；
 以及用不相关分组验证单个粗组更正不退化为全量计算。
+
+`tests/test_slice_impact.py` 用“逐笔移除后整算重算”的独立预言机核对完整
+撤回清单：粗组两个客户的出现次数重新分布而根值不变时，下一次查询换对的
+事实 ID；同一笔事实沿两条路径贡献相抵；撤回后依赖缺失（组仍在、值
+`null`）与根组消失的区别；共享去重值；整数 ID 类型；空粒度键；不存在
+的根组报错；少量不相关事实保证查询不把整库当候选（并检查 SQL 不出现全表
+扫描）；坏批次失败后重新打开库仍得到先前清单；查询不推进镜像版本；
+以及 CLI 端到端。
 
 ## 切片镜像交付（离线版本化补发）
 
