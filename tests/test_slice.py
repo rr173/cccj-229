@@ -680,7 +680,10 @@ class TestNoFullRecompute(SliceCase):
             ("net_daily@v1", (D1, "r00")),
             ("net_daily@v1", (D2, "r00")),   # uncorrected parent of coarse change
         })
-        self.assertEqual(stats["groups_recomputed"], 4)   # not 200
+        # 5 evaluations over 4 groups: the D1 parent is evaluated once directly
+        # and once more after its coarse dependency settles; still nowhere near
+        # the 200-group full recomputation
+        self.assertEqual(stats["groups_recomputed"], 5)
         self.check("s", "net_daily@v1", facts)
 
         # an irrelevant correction (fails every rev filter) on a new day

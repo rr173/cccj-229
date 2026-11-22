@@ -93,6 +93,31 @@ CREATE TABLE IF NOT EXISTS slice_refs (   -- reverse index: who references a dep
   parent_gkey   TEXT NOT NULL,
   PRIMARY KEY (slice_name, dep_metric, dep_gkey, parent_metric, parent_gkey)
 );
+-- ---- slice mirror delivery (see mirror.py) -------------------------------
+-- Persistent delivery identity + committed version of one enabled slice.
+-- source_id is generated once at enable time and never changes: reopening
+-- the database keeps it, and an independent source database gets a different
+-- id even for a slice of the same name at the same version number.
+CREATE TABLE IF NOT EXISTS slice_sync (
+  slice_name      TEXT PRIMARY KEY,
+  source_id       TEXT NOT NULL UNIQUE,
+  current_version INTEGER NOT NULL,       -- version 0 = full snapshot at enable
+  enabled_at      TEXT NOT NULL
+);
+-- Net root-group change per committed version, retained on disk.  A refresh
+-- that changes no root group still advances the version but writes no rows.
+-- Old rows are intentionally kept: delta exports read history from here and
+-- therefore never scan the live root groups.
+CREATE TABLE IF NOT EXISTS slice_sync_log (
+  slice_name TEXT NOT NULL,
+  version    INTEGER NOT NULL,            -- version produced by that refresh (>=1; 0 = enable snapshot)
+  gkey       TEXT NOT NULL,               -- canonical JSON array, root grain order
+  op         TEXT NOT NULL,               -- 'upsert' (value may be NULL) | 'delete'
+  value      TEXT,                        -- decimal integer text; NULL = null value or delete
+  PRIMARY KEY (slice_name, version, gkey)
+);
+CREATE INDEX IF NOT EXISTS idx_slice_sync_log_key
+  ON slice_sync_log (slice_name, gkey, version);
 """
 
 
@@ -233,3 +258,24 @@ def list_slices(db):
     return db.execute(
         "SELECT slice_name, catalog_id, catalog_seq, root_name, root_version,"
         " facts_count, created_at FROM slices ORDER BY slice_name").fetchall()
+
+
+# ----------------------------------------------------- slice mirror delivery
+
+def get_slice_sync(db, slice_name):
+    """Mirror-enablement state of a slice, or None when sync is not enabled."""
+    row = db.execute("SELECT * FROM slice_sync WHERE slice_name = ?",
+                     (slice_name,)).fetchone()
+    if row is None:
+        return None
+    return {"slice_name": row["slice_name"], "source_id": row["source_id"],
+            "current_version": row["current_version"],
+            "enabled_at": row["enabled_at"]}
+
+
+def list_slice_sync(db):
+    return db.execute(
+        "SELECT s.slice_name, s.source_id, s.current_version, s.enabled_at,"
+        " sl.catalog_id, sl.catalog_seq, sl.root_name, sl.root_version"
+        " FROM slice_sync s JOIN slices sl ON sl.slice_name = s.slice_name"
+        " ORDER BY s.slice_name").fetchall()

@@ -455,12 +455,21 @@ def init_slice(db, slice_name, catalog_id, seq, root_name, root_version):
     return closure
 
 
-def apply_batch(db, slice_name, corrections):
+def apply_batch(db, slice_name, corrections, on_commit=None):
     """Apply one validated correction batch incrementally and atomically.
 
     Only corrected rows are looked up, only groups they touch are recomputed,
     and changes propagate upstream through the reverse reference index.
     Everything commits in one transaction.  Returns refresh statistics.
+
+    ``on_commit`` is an optional callback ``fn(db, root_changes)`` invoked
+    inside that same transaction immediately before the commit.  It is only
+    used by slice mirror delivery; when absent the refresh behaves exactly as
+    before.  ``root_changes`` is the net change of the *root* metric's groups
+    produced by this batch: a list of ``(gkey, op, value)`` with
+    ``op='upsert'`` (value text or None) or ``op='delete'``.  A callback
+    raising rolls back the whole batch, so a failed version advance never
+    consumes a version.
     """
     meta = store.get_slice(db, slice_name)
     if meta is None:
@@ -469,6 +478,20 @@ def apply_batch(db, slice_name, corrections):
     closure = compile_closure(cat["content"], meta["root_name"],
                               meta["root_version"])
     metrics = closure.metrics
+    root_key = closure.root_key
+    # touched root gkey -> state at batch start.  ABSENT distinguishes a group
+    # that did not exist from one that existed with a SQL NULL value; the two
+    # must never collapse (a new null group is an upsert, not "no change").
+    ABSENT = object()
+    pre_root = {}
+
+    def snap_root(gk):
+        """Remember a root group's pre-batch state on first touch."""
+        if gk not in pre_root:
+            r = db.execute(
+                "SELECT value FROM slice_groups WHERE slice_name=? AND"
+                " metric=? AND gkey=?", (slice_name, root_key, gk)).fetchone()
+            pre_root[gk] = ABSENT if r is None else r["value"]
 
     # ---- read-only phase: old rows + delete existence (no writes yet) ------
     ids = [c["id"] for c in corrections]
@@ -542,6 +565,8 @@ def apply_batch(db, slice_name, corrections):
 
     def add_row(m, klist, row):
         gk = astx.canon(klist)
+        if m.key == root_key:
+            snap_root(gk)
         cur = db.execute(
             "SELECT row_count FROM slice_groups WHERE slice_name=? AND"
             " metric=? AND gkey=?", (slice_name, m.key, gk)).fetchone()
@@ -570,6 +595,8 @@ def apply_batch(db, slice_name, corrections):
 
     def remove_row(m, klist, row):
         gk = astx.canon(klist)
+        if m.key == root_key:
+            snap_root(gk)
         cur = db.execute(
             "SELECT row_count FROM slice_groups WHERE slice_name=? AND"
             " metric=? AND gkey=?", (slice_name, m.key, gk)).fetchone()
@@ -618,6 +645,24 @@ def apply_batch(db, slice_name, corrections):
 
     recomputed = []
     try:
+        # ---- phase 0: snapshot every root group this batch may touch -------
+        # This runs before any write, so a group that (re)appears below is
+        # still recorded as absent here — essential for distinguishing a newly
+        # appearing null-valued group from one that already existed.
+        if on_commit is not None:
+            root_metric = metrics[root_key]
+            root_keys = set()
+            for c in corrections:
+                old = old_rows.get(c["id"])
+                new = c["row"]
+                for row0 in (old, new):
+                    if row0 is not None and eval_filter(root_metric.filter,
+                                                        row0):
+                        root_keys.add(astx.canon(
+                            [row0[f] for f in root_metric.grain_fields]))
+            for gk in root_keys:
+                snap_root(gk)
+
         # ---- phase 1: fold corrected rows into their direct groups ---------
         delta_facts = 0
         for c in corrections:
@@ -632,6 +677,8 @@ def apply_batch(db, slice_name, corrections):
                 new_k = [new[f] for f in m.grain_fields] if new_q else None
                 if old_q and new_q and old_k == new_k:
                     gk = astx.canon(old_k)
+                    if m.key == root_key:
+                        snap_root(gk)
                     if adjust_leaves(m, gk, old, new):
                         dirty.add((m.key, gk))
                 else:
@@ -665,23 +712,35 @@ def apply_batch(db, slice_name, corrections):
                     (slice_name, mkey, gk)):
                 enqueue(r["parent_metric"], r["parent_gkey"])
 
+        def ensure_ref_edges(mkey, gk, klist):
+            """Backfill reverse-index edges for dependencies whose groups did
+            not exist when this parent group was first created, so a value
+            change in such a dependency still reaches every parent."""
+            for dep, idx in metrics[mkey].proj.items():
+                dep_gk = astx.canon([klist[i] for i in idx])
+                db.execute("INSERT OR IGNORE INTO slice_refs VALUES (?,?,?,?,?)",
+                           (slice_name, dep, dep_gk, mkey, gk))
+
         for mkey, gk in dirty:
             enqueue(mkey, gk)
         for mkey, gk in changed:        # appeared / disappeared groups
             notify(mkey, gk)
-        processed = set()
+        seen_passes = set()
         while heap:
-            # topological ranks make every group settle in one pass
+            # topological ranks order the first evaluation; a group may be
+            # re-enqueued by a dependency that settled after its first pass,
+            # so re-evaluation continues until no group value moves anymore.
             _, mkey, gk = heapq.heappop(heap)
-            if (mkey, gk) in processed:
-                continue
-            processed.add((mkey, gk))
+            if mkey == root_key:
+                snap_root(gk)
             row = db.execute(
                 "SELECT value FROM slice_groups WHERE slice_name=? AND"
                 " metric=? AND gkey=?", (slice_name, mkey, gk)).fetchone()
             if row is None:
                 continue                # group went away within this batch
-            val = compute_value(metrics[mkey], gk, json.loads(gk))
+            klist = json.loads(gk)
+            ensure_ref_edges(mkey, gk, klist)
+            val = compute_value(metrics[mkey], gk, klist)
             recomputed.append([mkey, gk])
             old_val = None if row["value"] is None else int(row["value"])
             if val != old_val:
@@ -690,7 +749,29 @@ def apply_batch(db, slice_name, corrections):
                            (None if val is None else str(val),
                             slice_name, mkey, gk))
                 notify(mkey, gk)
+            seen_passes.add((mkey, gk))
 
+        # ---- root-group net change (a key changed-and-reverted settles out) -
+        root_changes = []
+        if on_commit is not None and pre_root:
+            for gk, before in sorted(pre_root.items()):
+                r = db.execute(
+                    "SELECT value FROM slice_groups WHERE slice_name=? AND"
+                    " metric=? AND gkey=?",
+                    (slice_name, root_key, gk)).fetchone()
+                existed_before = before is not ABSENT
+                exists_after = r is not None
+                if not exists_after:
+                    if existed_before:             # group gone -> explicit delete
+                        root_changes.append((gk, "delete", None))
+                    continue
+                after = r["value"]                  # text or SQL NULL
+                if not existed_before or before != after:
+                    # appeared (even with a null value) or value changed
+                    root_changes.append((gk, "upsert", after))
+
+        if on_commit is not None:
+            on_commit(db, root_changes)
         db.commit()
     except Exception:
         db.rollback()

@@ -15,6 +15,12 @@ Interfaces:
   slice-refresh     apply a JSONL fact-correction batch to a slice (incremental)
   slice-read        read the root metric's groups of a slice (JSON)
   slices            list stored slices
+  mirror-enable     enable versioned mirror delivery for an existing slice (v0)
+  mirror-export     stream a full / delta integrity-checked mirror JSONL file
+  mirror-receive    verify + atomically apply a mirror file to a receiver db
+  mirror-query      read delivered groups/version from a receiver db (JSON)
+  mirror-status     list mirror-enabled slices in the source database
+  mirrors           list mirrors held by a receiver database
 """
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ import argparse
 import json
 import sys
 
-from . import core, loader, slices, store
+from . import core, loader, mirror, slices, store
 
 EXIT_OK, EXIT_INVALID, EXIT_INVALIDATED, EXIT_BLOCKED = 0, 1, 3, 4
 
@@ -374,9 +380,11 @@ def cmd_slice_refresh(args):
         _fail(f"batch rejected: {len(errors)} error(s); "
               f"slice '{args.slice}' unchanged", EXIT_INVALID)
     try:
-        stats = slices.apply_batch(db, args.slice, corrections)
-    except slices.SliceError as exc:
-        for err in exc.errors:
+        hook = mirror.make_advance_hook(db, args.slice)
+        stats = slices.apply_batch(db, args.slice, corrections, on_commit=hook)
+    except (slices.SliceError, mirror.MirrorError) as exc:
+        errs = exc.errors if isinstance(exc, slices.SliceError) else [str(exc)]
+        for err in errs:
             print(f"  INVALID: {err}", file=sys.stderr)
         _fail(f"batch rejected; slice '{args.slice}' unchanged", EXIT_INVALID)
     puts = sum(1 for c in corrections if c["op"] == "put")
@@ -384,6 +392,10 @@ def cmd_slice_refresh(args):
           f"{len(corrections) - puts} delete(s); facts={stats['facts']}")
     print(f"  rows examined: {stats['rows_examined']}, "
           f"groups recomputed: {stats['groups_recomputed']}")
+    if hook is not None:
+        sync = store.get_slice_sync(db, args.slice)
+        print(f"  mirror delivery: advanced to version {sync['current_version']}"
+              f" (source {sync['source_id'][:12]}…)")
 
 
 def cmd_slice_read(args):
@@ -402,6 +414,89 @@ def cmd_slices(args):
               f"{row['root_version']}  catalog={row['catalog_id']}"
               f"#{row['catalog_seq']}  facts={row['facts_count']}  "
               f"{row['created_at']}")
+
+
+# ------------------------------------------------------- mirror delivery cmds
+
+def cmd_mirror_enable(args):
+    db = store.connect(args.db)
+    try:
+        info = mirror.enable_sync(db, args.slice)
+    except mirror.MirrorError as exc:
+        _fail(str(exc), EXIT_INVALID)
+    print(f"mirror delivery enabled for slice '{args.slice}'")
+    print(f"  source_id: {info['source_id']}  (persistent identity of this "
+          f"source; deliverable coordinates are source_id+slice+version)")
+    print(f"  committed root groups snapshotted as version 0 "
+          f"({info['groups']} group(s)); no older history is fabricated")
+
+
+def cmd_mirror_export(args):
+    try:
+        info = mirror.export_file(args.db, args.slice, args.out,
+                                  from_version=args.from_version)
+    except mirror.MirrorError as exc:
+        _fail(str(exc), EXIT_INVALID)
+    span = ("full" if info["from_version"] is None
+            else f"v{info['from_version']} -> v{info['version']}")
+    print(f"wrote {info['kind']} ({span}) to {info['path']}")
+    print(f"  source_id: {info['source_id']}, records: {info['records']}, "
+          f"digest: {info['digest'][:16]}…")
+
+
+def cmd_mirror_receive(args):
+    db = mirror.mirror_connect(args.db)
+    try:
+        info = mirror.receive_file(db, args.file)
+    except mirror.MirrorError as exc:
+        _fail(str(exc), EXIT_INVALID)
+    finally:
+        db.close()
+    if info["redelivery"]:
+        print(f"identical file already received: ({info['source_id']}, "
+              f"{info['slice']}, v{info['version']}); no change applied")
+    else:
+        span = ("full" if info["from_version"] is None
+                else f"v{info['from_version']} -> v{info['version']}")
+        print(f"accepted {span} ({info['records']} record(s)); mirror is now at "
+              f"version {info['version']}")
+        print(f"  digest: {info['digest'][:16]}…")
+
+
+def cmd_mirror_query(args):
+    db = mirror.mirror_connect(args.db)
+    try:
+        result = mirror.query_mirror(db, args.source_id, args.slice,
+                                     key=args.key)
+    except mirror.MirrorError as exc:
+        _fail(str(exc), EXIT_INVALID)
+    finally:
+        db.close()
+    _emit(result, True)
+
+
+def cmd_mirror_status(args):
+    db = store.connect(args.db)
+    rows = store.list_slice_sync(db)
+    if not rows:
+        print("  (no slice has mirror delivery enabled)")
+    for r in rows:
+        print(f"  {r['slice_name']}  v{r['current_version']}  "
+              f"source_id={r['source_id']}  root={r['root_name']}@"
+              f"{r['root_version']}  catalog={r['catalog_id']}#"
+              f"{r['catalog_seq']}  enabled={r['enabled_at']}")
+
+
+def cmd_mirrors(args):
+    db = mirror.mirror_connect(args.db)
+    rows = mirror.list_mirrors(db)
+    db.close()
+    if not rows:
+        print("  (no mirrors in this receiver database)")
+    for r in rows:
+        print(f"  {r['slice_name']}  v{r['version']}  "
+              f"source_id={r['source_id']}  root={r['root_name']}@"
+              f"{r['root_version']}  grain={r['grain_json']}")
 
 
 # ------------------------------------------------------------------------ main
@@ -483,6 +578,44 @@ def main(argv=None):
 
     p = sub.add_parser("slices", help="list stored slices")
     p.set_defaults(fn=cmd_slices)
+
+    p = sub.add_parser("mirror-enable",
+                       help="enable mirror delivery for an existing slice and "
+                            "snapshot its committed root groups as version 0")
+    p.add_argument("--slice", required=True)
+    p.set_defaults(fn=cmd_mirror_enable)
+
+    p = sub.add_parser("mirror-export",
+                       help="stream a full file (no --from) or a delta file "
+                            "(--from an older version) of one slice")
+    p.add_argument("--slice", required=True)
+    p.add_argument("--out", required=True, help="output JSONL path")
+    p.add_argument("--from", dest="from_version", type=int, default=None,
+                   help="old version the receiver holds; omit for a full file")
+    p.set_defaults(fn=cmd_mirror_export)
+
+    p = sub.add_parser("mirror-receive",
+                       help="verify and atomically apply a mirror JSONL file "
+                            "to an independent receiver database")
+    p.add_argument("--file", required=True)
+    p.set_defaults(fn=cmd_mirror_receive)
+
+    p = sub.add_parser("mirror-query",
+                       help="read groups of one delivered version from a "
+                            "receiver database (JSON)")
+    p.add_argument("--source-id", required=True)
+    p.add_argument("--slice", required=True)
+    p.add_argument("--key", default=None,
+                   help="optional JSON key object/array for one group")
+    p.set_defaults(fn=cmd_mirror_query)
+
+    p = sub.add_parser("mirror-status",
+                       help="list mirror-enabled slices in the source database")
+    p.set_defaults(fn=cmd_mirror_status)
+
+    p = sub.add_parser("mirrors",
+                       help="list mirrors held by the receiver database")
+    p.set_defaults(fn=cmd_mirrors)
 
     args = ap.parse_args(argv)
     args.fn(args)

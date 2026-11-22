@@ -17,8 +17,9 @@ metric_analyzer/          产品代码
   astx.py                 受限 AST：校验、规范化、过滤条件蕴含、引用提取
   core.py                 语义 diff、影响分析、阻断规则、拓扑排序、计划应用（纯函数）
   loader.py               目录/注册表导入校验（引用必须可解析）
-  store.py                SQLite：目录/注册表版本历史、计划及输入绑定摘要、切片存储
+  store.py                SQLite：目录/注册表版本历史、计划、切片存储、镜像版本台账
   slices.py               离线指标切片：闭包编译、JSONL 更正解析、增量刷新、读取
+  mirror.py               切片镜像交付：源端启用/流式全量与补发、接收端校验/原子入库/查询
   cli.py                  全部对外接口
 reference/
   ref_analyzer.py         独立参考实现（零共享代码，按同一套 AST/契约规则重算）
@@ -26,8 +27,10 @@ demo/
   data/*.json             演示目录与注册表（收入/净收入/区域报表多版本）
   reconcile.py            产品 vs 参考 逐项对账
   run_demo.sh             端到端演示（含失败断言）
+  run_mirror_demo.py/.sh  切片镜像交付端到端自校验演示
 tests/
   test_slice.py           切片刷新链路测试（独立整算基准逐批核对）
+  test_mirror.py          镜像交付测试（版本、补发净差、完整性、来源链、快照并发）
 ```
 
 ## 数据模型
@@ -96,6 +99,11 @@ slice-init    --slice S --catalog cat-v1 --seq 1 --metric revenue@v1
 slice-refresh --slice S --file corr.jsonl  # 应用一批事实更正（增量）
 slice-read    --slice S                    # 读取根指标分组结果（JSON）
 slices                                   # 切片列表
+mirror-enable  --slice S                  # 现有切片启用镜像交付，落第 0 版
+mirror-export  --slice S --out f.jsonl [--from N]  # 全量或 N→当前版补发
+mirror-receive --db rpt.db --file f.jsonl # 接收端校验并原子入库（独立库）
+mirror-query   --db rpt.db --source-id ID --slice S [--key K]  # 查询镜像
+mirror-status                             # 源端已启用切片与版本；mirrors 列接收端
 ```
 
 退出码：0 成功；1 输入校验失败；3 计划已失效（输入变化）；4 计划状态不可执行。
@@ -208,3 +216,101 @@ python3 -m unittest
 过滤进出；删掉同一客户的部分订单再删其最后一条订单（去重计数）；依赖组
 消失时仍存在的父组 vs 根组消失 vs 结果为零；含坏行批次回滚后继续刷新；
 以及用不相关分组验证单个粗组更正不退化为全量计算。
+
+## 切片镜像交付（离线版本化补发）
+
+区域报表机只接收离线文件：它没有订单库，也不应看到订单明细。镜像交付只
+搬运**一个已存在命名切片的根指标分组**，不传事实、依赖组、目录或执行计划，
+也不改变刷新或指标求值规则。报表机拿到的是一个独立 SQLite 镜像库，不需要
+源库即可直接查询某一版的分组键和值。
+
+### 版本与来源身份
+
+- `mirror-enable` 为现有切片启用同步：把当时**已提交**的根结果记作第 0 版
+  （只顺序遍历一次根组，不补建旧历史），并生成一个 16 字节随机 `source_id`
+  作为这条来源链的持久身份。
+- 启用后，每次**成功**的 `slice-refresh` 都在刷新自己的事务内把版本前进一版，
+  即使根结果完全没变（空批次也占一版）；被拒绝或回滚的刷新不占版本。版本推进
+  与根组净变更、事实/物化值在同一事务提交，进程中断后重新打开库只能看到完整
+  的上一版。
+- 交付坐标是 `(source_id, slice_name, version)`，三者一起持久化，重开数据库
+  不变。另一份独立源库即使有同名切片、相同版本号，也有不同的 `source_id`，
+  无法接着往这个镜像里写。
+
+### 命令
+
+```bash
+python3 -m metric_analyzer.cli --db app.db <cmd>
+
+mirror-enable  --slice S                 # 现有切片启用同步，落第 0 版
+mirror-export  --slice S --out f.jsonl [--from N]
+                                         # 无 --from：全量；--from N：N→当前版补发
+mirror-status                            # 源库：列出已启用切片与当前版本
+# 报表机（独立库，无需源库）：
+mirror-receive --db rpt.db --file f.jsonl   # 校验并原子接收
+mirror-query   --db rpt.db --source-id ID --slice S [--key '{...}']
+mirrors       --db rpt.db                  # 列出该接收库中的镜像
+```
+
+### JSONL 文件格式（带完整性校验）
+
+每行一个 JSON 对象、UTF-8，三类行：
+
+1. **首行 header**：`kind`（`mirror-full`/`mirror-delta`）、`format`、`slice`、
+   `source_id`、`version`（delta 另有 `from_version`）、`root`、`grain`、
+   `catalog` 坐标。
+2. **中间记录**（流式写入，不把全部结果攒进内存）：
+   - 全量：`{"kind":"group", ...coords, "gkey":[...], "value":"<十进制>"|null}`，
+     列出该版所有根组；
+   - 补发：`{"kind":"op", ...coords, "gkey":[...], "change":"upsert"|"delete",
+     "value"?}`，每个键至多一条操作。新增或值不同给终点值；原来有而终点没有
+     给 `delete`（不带 value）；中途改了又恢复的键不发送。`upsert` 的
+     `value` 为 JSON `null` 表示"存在但值为 null 的组"，与删除严格区分。
+3. **末行 manifest**：`records`、`header_digest`（首行字节的 SHA-256）、
+   `digest`（除末行外全部字节的 SHA-256）。整数值以**十进制文本**传输，
+   任意精度（含超过 64 位的整数）端到端不丢精度。
+
+**如何确认文件结束、版本与来源身份**：文件的最后一行必须是 `manifest`，
+其后不得再有字节；其 `digest` 必须等于对前面所有字节流式算出的 SHA-256，
+`records` 必须与实际记录数一致，且每行的 `source_id/slice/version` 必须与
+header 一致。任一不符即视为截断/损坏，整体拒收。
+
+### 导出语义
+
+- 导出用独立连接打开一个 `BEGIN DEFERRED` 快照事务（源库切到 WAL，导出不
+  阻塞后续刷新）。一次导出只交付一个已提交时点：文件写到一半时中心再刷新，
+  新值既不会混进文件，也不会改写文件标注的版本；刷新无需等待整个文件写完。
+- 全量文件可在任一当前版本导出，但**只用于建立新镜像**。补发接受启用后的
+  任一旧版坐标，以**开始导出时的当前版本**为终点。
+- 补发不遍历全部事实或全部现存根组：每版刷新只把该版根组的净变更记入
+  `slice_sync_log`（磁盘保留，本题不清理）；补发仅取出区间内变更过的键，
+  逐键查两端状态求净差。初次全量允许顺序遍历根组；两类文件都通过服务端
+  游标流式产出。
+
+### 接收语义（独立 SQLite 库）
+
+接收在单事务内把记录写入临时暂存表并完成全部校验，任何失败都整体回滚——
+分组与接收坐标都不会前进；只有完整接收并提交后，重新打开库才能一起看到
+新分组和新坐标。具体规则：
+
+- 全量：仅当该 `(source_id, slice)` 镜像不存在时建立；已存在则拒收（过期
+  全量不能覆盖新结果），除非是台账里已记录的同一文件的精确重投。
+- 补发：镜像必须已存在，且其当前版本必须等于 `from_version`；从前版缺失、
+  另一条来源链（`source_id` 不同）或错误坐标起步都报错。
+- 同一完整文件可安全重投：台账按 `(source_id, slice, from_version, version)`
+  记录已接收文件的 `digest`，字节完全一致则幂等无操作；同坐标但内容不同
+  （digest 不同）一律拒收，不会被当成重投。
+
+### 测试与演示
+
+```bash
+python3 -m unittest                 # 含 tests/test_mirror.py 的 22 个交付测试
+bash demo/run_mirror_demo.sh        # 端到端自校验演示（无需服务/传输代理）
+```
+
+演示覆盖：从已有数据建 v0 镜像；跨多次刷新逐版补发，并把**实际补发项与
+手算的两端差异逐条核对**（含一次只改粗粒度依赖、却改变另一日期根组值的
+更正，改了又恢复的键不发送，null 组与删除的区分，超 64 位整数精度）；
+导出快照与并发刷新的版本一致性；截断件与校验伪造件被拒、坐标不动，随后
+完整件正常续收；以及独立来源链和同坐标异内容文件的拒收。
+
