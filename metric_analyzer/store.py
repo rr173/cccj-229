@@ -44,6 +44,55 @@ CREATE TABLE IF NOT EXISTS plans (
   result        TEXT NOT NULL,           -- full analysis JSON
   bindings      TEXT NOT NULL            -- bound digests of reports/consumers
 );
+-- ---- offline metric slices (see slices.py) -------------------------------
+CREATE TABLE IF NOT EXISTS slices (
+  slice_name   TEXT PRIMARY KEY,
+  catalog_id   TEXT NOT NULL,            -- pinned catalog import ...
+  catalog_seq  INTEGER NOT NULL,         -- ... (catalog_id, catalog_seq) never follows re-imports
+  root_name    TEXT NOT NULL,            -- root metric, explicitly versioned
+  root_version TEXT NOT NULL,
+  facts_count  INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS slice_facts (
+  slice_name TEXT NOT NULL,
+  fact_id    TEXT NOT NULL,              -- canonical JSON of the correction id
+  row_json   TEXT NOT NULL,              -- the flattened fact row as given
+  PRIMARY KEY (slice_name, fact_id)
+);
+CREATE TABLE IF NOT EXISTS slice_groups (
+  slice_name TEXT NOT NULL,
+  metric     TEXT NOT NULL,              -- "name@version"
+  gkey       TEXT NOT NULL,              -- JSON array of dim values, catalog grain order
+  row_count  INTEGER NOT NULL,           -- qualifying facts behind this group (> 0)
+  value      TEXT,                       -- decimal integer text; NULL = null value
+  PRIMARY KEY (slice_name, metric, gkey)
+);
+CREATE TABLE IF NOT EXISTS slice_sums (   -- one row per sum(field) leaf per group
+  slice_name TEXT NOT NULL,
+  metric     TEXT NOT NULL,
+  gkey       TEXT NOT NULL,
+  leaf       TEXT NOT NULL,
+  total      TEXT NOT NULL,              -- decimal integer text (exact, unbounded)
+  PRIMARY KEY (slice_name, metric, gkey, leaf)
+);
+CREATE TABLE IF NOT EXISTS slice_cds (    -- per-value refcounts per count_distinct leaf
+  slice_name TEXT NOT NULL,
+  metric     TEXT NOT NULL,
+  gkey       TEXT NOT NULL,
+  leaf       TEXT NOT NULL,
+  val        TEXT NOT NULL,
+  cnt        INTEGER NOT NULL,
+  PRIMARY KEY (slice_name, metric, gkey, leaf, val)
+);
+CREATE TABLE IF NOT EXISTS slice_refs (   -- reverse index: who references a dep group
+  slice_name    TEXT NOT NULL,
+  dep_metric    TEXT NOT NULL,
+  dep_gkey      TEXT NOT NULL,
+  parent_metric TEXT NOT NULL,
+  parent_gkey   TEXT NOT NULL,
+  PRIMARY KEY (slice_name, dep_metric, dep_gkey, parent_metric, parent_gkey)
+);
 """
 
 
@@ -100,6 +149,16 @@ def latest_catalog(db, catalog_id):
     return _latest(db, "catalogs", "catalog_id", catalog_id)
 
 
+def get_catalog(db, catalog_id, seq):
+    """Fetch one immutable catalog import by (catalog_id, seq)."""
+    row = db.execute(
+        "SELECT * FROM catalogs WHERE catalog_id = ? AND seq = ?",
+        (catalog_id, seq)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["catalog_id"], "seq": row["seq"], "hash": row["content_hash"],
+            "content": json.loads(row["content"]),
+            "imported_at": row["imported_at"]}
 def latest_registry(db, registry_id):
     return _latest(db, "registries", "registry_id", registry_id)
 
@@ -147,3 +206,30 @@ def list_plans(db):
     return db.execute(
         "SELECT plan_id, status, from_catalog, to_catalog, registry_id, created_at"
         " FROM plans ORDER BY created_at").fetchall()
+
+
+# ------------------------------------------------------------- metric slices
+
+def create_slice(db, slice_name, catalog_id, catalog_seq, root_name, root_version):
+    db.execute(
+        "INSERT INTO slices (slice_name, catalog_id, catalog_seq, root_name,"
+        " root_version, facts_count, created_at) VALUES (?,?,?,?,?,0,?)",
+        (slice_name, catalog_id, catalog_seq, root_name, root_version, _now()))
+    db.commit()
+
+
+def get_slice(db, slice_name):
+    row = db.execute("SELECT * FROM slices WHERE slice_name = ?",
+                     (slice_name,)).fetchone()
+    if row is None:
+        return None
+    return {"slice_name": row["slice_name"], "catalog_id": row["catalog_id"],
+            "catalog_seq": row["catalog_seq"], "root_name": row["root_name"],
+            "root_version": row["root_version"], "facts_count": row["facts_count"],
+            "created_at": row["created_at"]}
+
+
+def list_slices(db):
+    return db.execute(
+        "SELECT slice_name, catalog_id, catalog_seq, root_name, root_version,"
+        " facts_count, created_at FROM slices ORDER BY slice_name").fetchall()

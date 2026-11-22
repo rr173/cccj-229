@@ -11,6 +11,10 @@ Interfaces:
   execute           apply a READY plan (fails if inputs changed -> INVALIDATED)
   export-registry   print the current registry content (post-migration queries)
   plans             list stored plans
+  slice-init        create a named offline slice (pinned catalog import + root)
+  slice-refresh     apply a JSONL fact-correction batch to a slice (incremental)
+  slice-read        read the root metric's groups of a slice (JSON)
+  slices            list stored slices
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import argparse
 import json
 import sys
 
-from . import core, loader, store
+from . import core, loader, slices, store
 
 EXIT_OK, EXIT_INVALID, EXIT_INVALIDATED, EXIT_BLOCKED = 0, 1, 3, 4
 
@@ -330,6 +334,76 @@ def cmd_plans(args):
               f"(registry {row['registry_id']})  {row['created_at']}")
 
 
+# ------------------------------------------------------------- slice commands
+
+def cmd_slice_init(args):
+    name, sep, version = args.metric.partition("@")
+    if not sep or not name or not version:
+        _fail("--metric must be given as name@version", EXIT_INVALID)
+    db = store.connect(args.db)
+    try:
+        closure = slices.init_slice(db, args.slice, args.catalog, args.seq,
+                                    name, version)
+    except slices.SliceError as exc:
+        for err in exc.errors:
+            print(f"  INVALID: {err}", file=sys.stderr)
+        _fail(f"slice '{args.slice}' rejected: {len(exc.errors)} error(s)",
+              EXIT_INVALID)
+    print(f"slice '{args.slice}' created: root={name}@{version}, "
+          f"catalog='{args.catalog}' seq={args.seq}")
+    print(f"  closure: {len(closure.metrics)} metric(s): "
+          + ", ".join(sorted(closure.metrics)))
+    print("  pinned to this catalog import; starts empty and only accepts "
+          "fact corrections from now on")
+
+
+def cmd_slice_refresh(args):
+    db = store.connect(args.db)
+    meta = store.get_slice(db, args.slice)
+    if meta is None:
+        _fail(f"slice '{args.slice}' not found", EXIT_INVALID)
+    cat = store.get_catalog(db, meta["catalog_id"], meta["catalog_seq"])
+    closure = slices.compile_closure(cat["content"], meta["root_name"],
+                                     meta["root_version"])
+    with open(args.file, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    corrections, errors = slices.parse_batch(text, closure.required_spec())
+    if errors:
+        for err in errors:
+            print(f"  INVALID: {err}", file=sys.stderr)
+        _fail(f"batch rejected: {len(errors)} error(s); "
+              f"slice '{args.slice}' unchanged", EXIT_INVALID)
+    try:
+        stats = slices.apply_batch(db, args.slice, corrections)
+    except slices.SliceError as exc:
+        for err in exc.errors:
+            print(f"  INVALID: {err}", file=sys.stderr)
+        _fail(f"batch rejected; slice '{args.slice}' unchanged", EXIT_INVALID)
+    puts = sum(1 for c in corrections if c["op"] == "put")
+    print(f"slice '{args.slice}': applied {puts} put(s), "
+          f"{len(corrections) - puts} delete(s); facts={stats['facts']}")
+    print(f"  rows examined: {stats['rows_examined']}, "
+          f"groups recomputed: {stats['groups_recomputed']}")
+
+
+def cmd_slice_read(args):
+    db = store.connect(args.db)
+    try:
+        result = slices.read_slice(db, args.slice)
+    except slices.SliceError as exc:
+        _fail(exc.errors[0], EXIT_INVALID)
+    _emit(result, True)
+
+
+def cmd_slices(args):
+    db = store.connect(args.db)
+    for row in store.list_slices(db):
+        print(f"  {row['slice_name']}  root={row['root_name']}@"
+              f"{row['root_version']}  catalog={row['catalog_id']}"
+              f"#{row['catalog_seq']}  facts={row['facts_count']}  "
+              f"{row['created_at']}")
+
+
 # ------------------------------------------------------------------------ main
 
 def main(argv=None):
@@ -385,6 +459,30 @@ def main(argv=None):
 
     p = sub.add_parser("plans", help="list stored plans")
     p.set_defaults(fn=cmd_plans)
+
+    p = sub.add_parser("slice-init",
+                       help="create a named offline slice bound to one catalog "
+                            "import and one explicitly versioned root metric")
+    p.add_argument("--slice", required=True, help="name of the slice to create")
+    p.add_argument("--catalog", required=True, help="catalog_id of an imported catalog")
+    p.add_argument("--seq", type=int, required=True,
+                   help="import sequence number of the catalog")
+    p.add_argument("--metric", required=True, help="root metric as name@version")
+    p.set_defaults(fn=cmd_slice_init)
+
+    p = sub.add_parser("slice-refresh",
+                       help="apply a JSONL fact-correction batch to a slice")
+    p.add_argument("--slice", required=True)
+    p.add_argument("--file", required=True, help="JSONL corrections file")
+    p.set_defaults(fn=cmd_slice_refresh)
+
+    p = sub.add_parser("slice-read",
+                       help="read the root metric's groups of a slice (JSON)")
+    p.add_argument("--slice", required=True)
+    p.set_defaults(fn=cmd_slice_read)
+
+    p = sub.add_parser("slices", help="list stored slices")
+    p.set_defaults(fn=cmd_slices)
 
     args = ap.parse_args(argv)
     args.fn(args)
